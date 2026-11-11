@@ -14,19 +14,22 @@ private final class ProgressPresentation: ObservableObject {
 
 @MainActor
 final class ProgressOverlayController {
+    private static let shadowPadding: CGFloat = 12
     private let presentation = ProgressPresentation()
     private var panel: NSPanel?
+    private var materialView: NSView?
     private var displayedProcessID: pid_t?
 
     func show(application: NSRunningApplication, progress: Double, awaitingRelease: Bool = false) {
         if panel == nil {
             let panel = NSPanel(
-                contentRect: NSRect(x: 0, y: 0, width: 240, height: 210),
+                contentRect: NSRect(x: 0, y: 0, width: 240 + Self.shadowPadding * 2,
+                                    height: 210 + Self.shadowPadding * 2),
                 styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false
             )
             panel.isOpaque = false
             panel.backgroundColor = .clear
-            panel.hasShadow = true
+            panel.hasShadow = false
             panel.level = .statusBar
             panel.hidesOnDeactivate = false
             panel.ignoresMouseEvents = true
@@ -49,6 +52,9 @@ final class ProgressOverlayController {
         }
         presentation.progress = progress
         presentation.awaitingRelease = awaitingRelease
+        if #available(macOS 26.0, *), let glass = materialView as? DesktopGlassEffectView {
+            glass.updateBackdrop()
+        }
     }
 
     func hide() {
@@ -57,29 +63,58 @@ final class ProgressOverlayController {
     }
 
     private func makeMaterialView(frame: NSRect) -> NSView {
+        let container = NSView(frame: frame)
+        container.wantsLayer = true
+        let materialFrame = container.bounds.insetBy(dx: Self.shadowPadding, dy: Self.shadowPadding)
+        let cornerRadius: CGFloat = 22
         let content = NSHostingView(rootView: HoldProgressView(presentation: presentation))
-        content.frame = NSRect(origin: .zero, size: frame.size)
+        content.frame = NSRect(origin: .zero, size: materialFrame.size)
         content.autoresizingMask = [.width, .height]
 
+        // A small exterior shadow gives the glass depth without the heavy
+        // system window shadow. Mask its center so it cannot darken the glass.
+        let outline = CGPath(roundedRect: materialFrame, cornerWidth: cornerRadius,
+                             cornerHeight: cornerRadius, transform: nil)
+        let shadow = CALayer()
+        shadow.frame = container.bounds
+        shadow.shadowColor = NSColor.black.cgColor
+        shadow.shadowOpacity = 0.12
+        shadow.shadowRadius = 4
+        shadow.shadowOffset = CGSize(width: 0, height: -1)
+        shadow.shadowPath = outline
+        let exterior = CGMutablePath()
+        exterior.addRect(container.bounds)
+        exterior.addPath(outline)
+        let mask = CAShapeLayer()
+        mask.frame = container.bounds
+        mask.path = exterior
+        mask.fillRule = .evenOdd
+        shadow.mask = mask
+        container.layer?.addSublayer(shadow)
+
+        let material: NSView
         if #available(macOS 26.0, *) {
-            let glass = NSGlassEffectView(frame: frame)
-            glass.style = .regular
-            glass.cornerRadius = 22
+            let glass = DesktopGlassEffectView(frame: materialFrame)
+            glass.style = .clear
+            glass.cornerRadius = cornerRadius
             // Leave tint and alpha at their system defaults. Native glass
             // follows the user's Liquid Glass and accessibility preferences.
             glass.contentView = content
-            return glass
+            material = glass
         } else {
-            let material = NSVisualEffectView(frame: frame)
-            material.material = .hudWindow
-            material.blendingMode = .behindWindow
-            material.state = .active
-            material.wantsLayer = true
-            material.layer?.cornerRadius = 22
-            material.layer?.masksToBounds = true
-            material.addSubview(content)
-            return material
+            let visualEffect = NSVisualEffectView(frame: materialFrame)
+            visualEffect.material = .hudWindow
+            visualEffect.blendingMode = .behindWindow
+            visualEffect.state = .active
+            visualEffect.wantsLayer = true
+            visualEffect.layer?.cornerRadius = cornerRadius
+            visualEffect.layer?.masksToBounds = true
+            visualEffect.addSubview(content)
+            material = visualEffect
         }
+        container.addSubview(material)
+        materialView = material
+        return container
     }
 
     private func screen(for application: NSRunningApplication) -> NSScreen? {
@@ -114,6 +149,73 @@ final class ProgressOverlayController {
     private func intersectionArea(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
         let intersection = lhs.intersection(rhs)
         return intersection.isNull ? 0 : intersection.width * intersection.height
+    }
+}
+
+@available(macOS 26.0, *)
+@MainActor
+private final class DesktopGlassEffectView: NSGlassEffectView {
+    private var isUpdatingBackdrop = false
+    private var hasAdjustedBackdrop = false
+
+    override func layout() {
+        super.layout()
+        updateBackdrop()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil else { return }
+        DispatchQueue.main.async { [weak self] in self?.updateBackdrop() }
+    }
+
+    func updateBackdrop() {
+        guard !isUpdatingBackdrop else { return }
+        isUpdatingBackdrop = true
+        defer { isUpdatingBackdrop = false }
+
+        let workspace = NSWorkspace.shared
+        if workspace.accessibilityDisplayShouldReduceTransparency || workspace.accessibilityDisplayShouldIncreaseContrast {
+            if hasAdjustedBackdrop {
+                hasAdjustedBackdrop = false
+                // Rebuild the system material so accessibility takes precedence.
+                style = .regular
+                style = .clear
+            }
+            return
+        }
+
+        // Standalone windows retain a blur even with clear glass. Limit only
+        // that blur; macOS still renders the material, lensing and highlights.
+        // These Core Animation filter inputs are private. Leave native clear
+        // glass untouched when the filter or its numeric input is unavailable.
+        var visited = Set<ObjectIdentifier>()
+        func updateLayer(_ layer: CALayer) {
+            guard visited.insert(ObjectIdentifier(layer)).inserted else { return }
+            if let filters = layer.filters {
+                var changed = false
+                for filter in filters {
+                    guard let object = filter as? NSObject,
+                          object.responds(to: NSSelectorFromString("type")),
+                          object.responds(to: NSSelectorFromString("inputKeys")),
+                          object.value(forKey: "type") as? String == "glassBackground",
+                          let keys = object.value(forKey: "inputKeys") as? [String],
+                          keys.contains("inputBlurRadius"),
+                          let radius = object.value(forKey: "inputBlurRadius") as? NSNumber,
+                          radius.doubleValue > 2 else { continue }
+                    object.setValue(2.0, forKey: "inputBlurRadius")
+                    changed = true
+                    hasAdjustedBackdrop = true
+                }
+                if changed { layer.filters = filters }
+            }
+            for child in layer.sublayers ?? [] { updateLayer(child) }
+        }
+        func updateView(_ view: NSView) {
+            if let layer = view.layer { updateLayer(layer) }
+            for child in view.subviews { updateView(child) }
+        }
+        updateView(self)
     }
 }
 
